@@ -28,6 +28,38 @@ use ui::{
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     logging::init();
+    #[cfg(target_os = "windows")]
+    {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            previous(info);
+            show_windows_error(&info.to_string());
+        }));
+    }
+    let result = run();
+    #[cfg(target_os = "windows")]
+    if let Err(error) = &result {
+        show_windows_error(&format!("{error:#}"));
+    }
+    result
+}
+
+#[cfg(target_os = "windows")]
+fn show_windows_error(message: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+    let message: Vec<_> = message.encode_utf16().chain([0]).collect();
+    let title: Vec<_> = desktop::APP_NAME.encode_utf16().chain([0]).collect();
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            message.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("starting application");
     let assets = Assets::new()?;
     let persistence = Persistence::new()?;
@@ -52,7 +84,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     application.run(move |cx: &mut App| {
         cx.set_app_identity(desktop::APP_ID, desktop::APP_NAME);
         cx.set_global(api);
-        theme::load_fonts(cx).expect("failed to load external dolphin fonts");
+        if let Err(error) = theme::load_fonts(cx) {
+            log::warn!("无法加载 Dolphin 显示字体：{error:#}");
+        }
         gpui_kit::init(cx);
         theme::init(cx);
         let bounds = Bounds::centered(None, main_window_size(cx), cx);
@@ -136,7 +170,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 main_window
             },
         )
-        .unwrap();
+        .expect("无法创建主窗口");
         let (playback, library) = desktop_handles.expect("open_window 会运行构建闭包");
         desktop::init(window, view, playback, library, cx);
         cx.spawn(async move |cx| {

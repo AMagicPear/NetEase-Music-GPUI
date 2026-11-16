@@ -176,7 +176,7 @@ impl ProgressBar {
                                 && let Some(position) =
                                     seek_position(value.end(), playback.snapshot().duration)
                             {
-                                playback.seek_to(position, cx);
+                                playback.seek_to(position, revision, cx);
                             }
                         });
                     }

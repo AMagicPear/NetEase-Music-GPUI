@@ -37,6 +37,7 @@ sha2 = "0.10"
 base64 = "0.22"
 tempfile = "3"
 smallvec = "1"
+arc-swap = "1"
 # 二维码编码；SVG 直接交给 GPUI 渲染，不需要图像编码依赖。
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 

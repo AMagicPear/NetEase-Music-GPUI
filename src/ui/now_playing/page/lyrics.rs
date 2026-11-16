@@ -290,6 +290,7 @@ impl Render for LyricsView {
                 .into_any_element();
         }
         let view = cx.weak_entity();
+        let revision = self.playback.read(cx).snapshot().revision;
         div()
             .size_full()
             .relative()
@@ -345,8 +346,9 @@ impl Render for LyricsView {
                             .text_color(white().alpha(weight))
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.playback
-                                    .update(cx, |playback, cx| playback.seek_to(time, cx));
+                                this.playback.update(cx, |playback, cx| {
+                                    playback.seek_to(time, revision, cx)
+                                });
                             }))
                             .child(line.text.clone())
                             .when_some(line.translation.clone(), |line, translation| {

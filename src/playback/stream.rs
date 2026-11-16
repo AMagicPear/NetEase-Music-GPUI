@@ -2,7 +2,7 @@ mod decode;
 mod download;
 mod output;
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 pub use output::BufferedSource;
 
@@ -105,6 +105,7 @@ impl StreamingAudio {
         data.seek = Some(position);
         data.decode_finished = false;
         data.error = None;
+        self.pcm.closed_queue.store(false, Ordering::Release);
         self.pcm.output_drained.store(false, Ordering::Release);
         self.pcm.buffering.store(true, Ordering::Release);
         self.pcm

@@ -102,7 +102,12 @@ pub(super) fn decode(
         let mut data = pcm.data.lock().unwrap();
         if pcm.control.is_current(generation) {
             match result {
-                Ok(()) => data.decode_finished = true,
+                Ok(()) => {
+                    data.decode_finished = true;
+                    if data.chunks.is_empty() {
+                        pcm.closed_queue.store(true, Ordering::Release);
+                    }
+                }
                 Err(error) => {
                     if error.corrupt {
                         // 只有确认内容损坏时淘汰租约，操作失败后仍允许恢复下载并提交。

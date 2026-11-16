@@ -33,6 +33,7 @@ impl PlaybackController {
     }
 
     pub fn exit_heart_mode(&mut self, cx: &mut Context<Self>) {
+        self.settle_gapless(true, cx);
         self.cancel_heart();
         self.cancel_preload();
         self.save_cache();
@@ -57,6 +58,8 @@ impl PlaybackController {
         if self.state.heart_loading || !self.heart_reachable() {
             return;
         }
+        self.settle_gapless(true, cx);
+        self.cancel_preload();
         let source = self.heart_source.clone();
         self.cancel_heart();
         self.heart = source;
@@ -81,6 +84,8 @@ impl PlaybackController {
         let Some(source) = self.heart_source.clone() else {
             return false;
         };
+        self.settle_gapless(true, cx);
+        self.cancel_preload();
         self.cancel_heart();
         self.heart = Some(source);
         // 不是接着当前队列播，而是换一条新的。
@@ -146,6 +151,7 @@ impl PlaybackController {
                 if generation != this.heart_generation {
                     return;
                 }
+                this.settle_gapless(true, cx);
                 let selection = this.finish_heart(generation, result);
                 if let Some((song, play)) = selection {
                     this.load_song(song, Duration::ZERO, play, cx);

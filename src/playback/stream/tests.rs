@@ -7,25 +7,54 @@ use std::io::Read;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn wav(seconds: u32) -> Vec<u8> {
-    let data_len = seconds * 48000 * 2;
-    let mut bytes = b"RIFF".to_vec();
-    bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
-    bytes.extend_from_slice(b"WAVEfmt ");
-    bytes.extend_from_slice(&16_u32.to_le_bytes());
-    bytes.extend_from_slice(&1_u16.to_le_bytes());
-    bytes.extend_from_slice(&1_u16.to_le_bytes());
-    bytes.extend_from_slice(&48000_u32.to_le_bytes());
-    bytes.extend_from_slice(&96000_u32.to_le_bytes());
-    bytes.extend_from_slice(&2_u16.to_le_bytes());
-    bytes.extend_from_slice(&16_u16.to_le_bytes());
-    bytes.extend_from_slice(b"data");
-    bytes.extend_from_slice(&data_len.to_le_bytes());
+    let mut bytes = wav_header(48000, 1, seconds * 48000 * 2);
     for second in 0..seconds {
         for _ in 0..48000 {
             bytes.extend_from_slice(&((second % 32 + 1) as i16 * 1000).to_le_bytes());
         }
     }
     bytes
+}
+
+fn wav_header(sample_rate: u32, channels: u16, data_len: u32) -> Vec<u8> {
+    let frame_bytes = channels * 2;
+    let mut bytes = b"RIFF".to_vec();
+    bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16_u32.to_le_bytes());
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&channels.to_le_bytes());
+    bytes.extend_from_slice(&sample_rate.to_le_bytes());
+    bytes.extend_from_slice(&(sample_rate * u32::from(frame_bytes)).to_le_bytes());
+    bytes.extend_from_slice(&frame_bytes.to_le_bytes());
+    bytes.extend_from_slice(&16_u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&data_len.to_le_bytes());
+    bytes
+}
+
+pub(in crate::playback) async fn short_wav(
+    samples: &[i16],
+    sample_rate: u32,
+    channels: u16,
+) -> (StreamingAudio, BufferedSource) {
+    let mut bytes = wav_header(sample_rate, channels, (samples.len() * 2) as u32);
+    bytes.extend(samples.iter().flat_map(|sample| sample.to_le_bytes()));
+    let server = serve(bytes, true, None, None).await;
+    let (audio, output) = open(&server).await;
+    let pcm = output.pcm.clone();
+    tokio::task::spawn_blocking(move || {
+        let (data, _) = pcm
+            .changed
+            .wait_timeout_while(pcm.data.lock().unwrap(), Duration::from_secs(3), |data| {
+                !data.decode_finished
+            })
+            .unwrap();
+        assert!(data.decode_finished);
+    })
+    .await
+    .unwrap();
+    (audio, output)
 }
 
 struct Server {
@@ -281,9 +310,12 @@ async fn seek_fetches_target_range_and_cached_return_interrupts_stalled_download
         let (data, timeout) = cache
             .changed
             .wait_timeout_while(data, Duration::from_secs(3), |data| {
-                data.blocks
-                    .get(&0)
-                    .is_none_or(|length| *length < BLOCK_BYTES as usize)
+                // Keep the target block as the first hole when restarting the
+                // connection. Otherwise the active request may start at an
+                // earlier hole even though it also covers the target.
+                (0..3).any(|block| {
+                    data.blocks.get(&(block * BLOCK_BYTES)).copied() != Some(BLOCK_BYTES as usize)
+                })
             })
             .unwrap();
         assert!(!timeout.timed_out());
@@ -717,6 +749,36 @@ fn output_is_nonblocking_and_silence_preserves_stereo_alignment_and_progress() {
     let mut frame = [1_f32; 2];
     assert!(!output.read_frame(&mut frame));
     assert_eq!(frame, [0., 0.]);
+}
+
+#[test]
+fn output_reports_known_eof_even_when_the_empty_queue_is_locked() {
+    let pcm = Arc::new(Pcm::default());
+    let mut output = source(pcm.clone());
+    {
+        let mut data = pcm.data.lock().unwrap();
+        data.queued_samples = 2;
+        data.chunks.push_back(Chunk {
+            samples: vec![0.25, 0.75],
+            position: Duration::ZERO,
+            generation: 0,
+        });
+        data.decode_finished = true;
+    }
+    output.playback_gain = 1.;
+    let mut frames = [0.; 2];
+    assert_eq!(output.write_playback(&mut frames, 1., true), 2);
+    assert_eq!(frames, [0.25, 0.75]);
+    assert!(!pcm.output_drained.load(Ordering::Acquire));
+
+    {
+        let _busy = pcm.data.lock().unwrap();
+        assert_eq!(output.write_playback(&mut frames, 1., true), 0);
+    }
+    assert_eq!(output.write_playback(&mut frames, 1., true), 0);
+    assert!(!pcm.output_drained.load(Ordering::Acquire));
+    output.confirm_end();
+    assert!(pcm.output_drained.load(Ordering::Acquire));
 }
 
 #[test]
