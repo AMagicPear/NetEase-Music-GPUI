@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import plistlib
 import tempfile
@@ -44,6 +45,7 @@ class PackageTests(unittest.TestCase):
             self.assertEqual(archive.with_name("music.zip.sha256").read_text().split()[0],
                              hashlib.sha256(archive.read_bytes()).hexdigest())
 
+    @unittest.skipUnless(os.name == "posix", "POSIX file mode bits are required")
     def test_linux_archive_keeps_executable_and_assets_together(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
