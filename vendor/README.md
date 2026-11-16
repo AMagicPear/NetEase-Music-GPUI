@@ -8,7 +8,9 @@
 - `gpui-image-transform-0.1.15.patch`：图片 GPU 旋转，同步 fast 图层的矩阵、边界、位移和缓存指纹。
 - `gpui-windows-image-transform-0.1.15.patch`：为 DirectX 同步图片结构、GPU 旋转、局部圆角裁剪及图集采样边界。
 - `gpui-backdrop-blur-0.1.15.patch`：圆角矩形背景模糊（毛玻璃），适配 `objc2-metal` 与 fast 绘制路径。
-- `gpui-windows-backdrop-blur-0.1.15.patch`：DirectX 忽略仅由 Metal 实现的背景模糊批次。
+- `gpui-windows-backdrop-blur-0.1.15.patch`：DirectX 的传统与 fast 两条绘制路径均跳过仅由 Metal 实现的背景模糊批次。
+- `gpui-windows-renderer-fallback-0.1.15.patch`：硬件初始化失败时尝试 WARP。DirectComposition 初始化失败时回退到普通 HWND 交换链。
+- `gpui-windows-fxc-discovery-0.1.15.patch`：从 PATH 或已安装的 Windows SDK 中选择实际存在的 `fxc.exe`。
 - `gpui-svg-app-fonts-0.1.15.patch`：SVG 文本加载 `assets/font/` 中的应用字体，用于推荐页日历等图案。
   上游只加载固定的 `fonts/ibm-plex-sans/` 和 `fonts/lilex/`，因此仍需该补丁。
   项目的 `AssetSource::list("font")` 返回文件名，加载时补回 `font/` 前缀。

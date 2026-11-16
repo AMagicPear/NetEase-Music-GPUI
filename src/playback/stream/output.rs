@@ -106,7 +106,9 @@ impl BufferedSource {
             self.chunk = Self::pop_chunk(pcm, &mut data);
             self.sample_index = 0;
             let drained = self.chunk.is_none() && data.decode_finished && data.error.is_none();
-            self.pcm.output_drained.store(drained, Ordering::Release);
+            if !drained {
+                self.pcm.output_drained.store(false, Ordering::Release);
+            }
             self.pcm
                 .buffering
                 .store(self.chunk.is_none() && !drained, Ordering::Release);
@@ -139,9 +141,28 @@ impl BufferedSource {
         FrameRead::Continue
     }
 
+    /// Report EOF only once the device callback has decided no successor can
+    /// continue. A seek resets the queue under the same lock.
+    pub(crate) fn confirm_end(&self) {
+        if let Ok(data) = self.pcm.data.try_lock()
+            && self.chunk.is_none()
+            && data.chunks.is_empty()
+            && data.decode_finished
+            && data.error.is_none()
+        {
+            self.pcm.output_drained.store(true, Ordering::Release);
+        }
+    }
+
     #[cfg(test)]
     pub fn read_frame(&mut self, frame: &mut [f32]) -> bool {
-        self.read_pcm_frame(frame) != FrameRead::Cancelled
+        match self.read_pcm_frame(frame) {
+            FrameRead::End => {
+                self.confirm_end();
+                true
+            }
+            result => result != FrameRead::Cancelled,
+        }
     }
 
     /// 直接填充交错 f32 缓冲，并应用音量。
@@ -170,7 +191,10 @@ impl BufferedSource {
                 frame.fill(0.);
                 continue;
             }
-            if self.read_pcm_frame(frame) == FrameRead::End && playing {
+            if self.read_pcm_frame(frame) == FrameRead::End {
+                if !playing {
+                    self.playback_gain = 0.;
+                }
                 let end = index * channels;
                 output[end..].fill(0.);
                 return end;

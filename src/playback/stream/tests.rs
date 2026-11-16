@@ -310,9 +310,12 @@ async fn seek_fetches_target_range_and_cached_return_interrupts_stalled_download
         let (data, timeout) = cache
             .changed
             .wait_timeout_while(data, Duration::from_secs(3), |data| {
-                data.blocks
-                    .get(&0)
-                    .is_none_or(|length| *length < BLOCK_BYTES as usize)
+                // Keep the target block as the first hole when restarting the
+                // connection. Otherwise the active request may start at an
+                // earlier hole even though it also covers the target.
+                (0..3).any(|block| {
+                    data.blocks.get(&(block * BLOCK_BYTES)).copied() != Some(BLOCK_BYTES as usize)
+                })
             })
             .unwrap();
         assert!(!timeout.timed_out());
@@ -773,6 +776,8 @@ fn output_reports_known_eof_even_when_the_empty_queue_is_locked() {
         assert_eq!(output.write_playback(&mut frames, 1., true), 0);
     }
     assert_eq!(output.write_playback(&mut frames, 1., true), 0);
+    assert!(!pcm.output_drained.load(Ordering::Acquire));
+    output.confirm_end();
     assert!(pcm.output_drained.load(Ordering::Acquire));
 }
 

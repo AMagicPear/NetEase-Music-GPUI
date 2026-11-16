@@ -1,0 +1,50 @@
+--- a/vendor/gpui-fast-windows/build.rs
++++ b/vendor/gpui-fast-windows/build.rs
+@@ -26,7 +26,8 @@
+     };
+ 
+     pub fn compile_shaders() {
+-        let shader_path = crate::fast_rounded_clip_shader::generated_path(std::env::var("OUT_DIR").unwrap());
++        let shader_path =
++            crate::fast_rounded_clip_shader::generated_path(std::env::var("OUT_DIR").unwrap());
+         let out_dir = std::env::var("OUT_DIR").unwrap();
+ 
+         println!("cargo:rerun-if-changed={}", shader_path.display());
+@@ -93,16 +94,10 @@
+             ))?,
+         };
+ 
+-        if let Some(highest_version) = versions.last() {
+-            return Ok(Some(
+-                install_folder_bin
+-                    .join(highest_version)
+-                    .join(arch)
+-                    .join(binary),
+-            ));
+-        }
+-
+-        Ok(None)
++        Ok(versions.into_iter().rev().find_map(|version| {
++            let path = install_folder_bin.join(version).join(arch).join(binary);
++            path.is_file().then_some(path)
++        }))
+     }
+ 
+     /// You can set the `GPUI_FXC_PATH` environment variable to specify the path to the fxc.exe compiler.
+@@ -121,8 +116,14 @@
+             .output()
+             && output.status.success()
+         {
+-            let path = String::from_utf8_lossy(&output.stdout);
+-            return path.trim().to_string();
++            let output = String::from_utf8_lossy(&output.stdout);
++            if let Some(path) = output
++                .lines()
++                .map(str::trim)
++                .find(|path| Path::new(path).is_file())
++            {
++                return path.to_owned();
++            }
+         }
+ 
+         if let Ok(Some(path)) = find_latest_windows_sdk_binary("fxc.exe") {

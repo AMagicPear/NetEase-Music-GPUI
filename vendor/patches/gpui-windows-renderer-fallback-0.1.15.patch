@@ -1,0 +1,192 @@
+--- a/vendor/gpui-fast-windows/src/directx_devices.rs
++++ b/vendor/gpui-fast-windows/src/directx_devices.rs
+@@ -15,7 +15,7 @@
+         },
+         Dxgi::{
+             CreateDXGIFactory2, DXGI_CREATE_FACTORY_DEBUG, DXGI_CREATE_FACTORY_FLAGS,
+-            IDXGIAdapter1, IDXGIFactory6,
++            DXGI_ERROR_NOT_FOUND, IDXGIAdapter1, IDXGIFactory2, IDXGIFactory4,
+         },
+     },
+ };
+@@ -38,7 +38,7 @@
+ #[derive(Clone)]
+ pub(crate) struct DirectXDevices {
+     pub(crate) adapter: IDXGIAdapter1,
+-    pub(crate) dxgi_factory: IDXGIFactory6,
++    pub(crate) dxgi_factory: IDXGIFactory2,
+     pub(crate) device: ID3D11Device,
+     pub(crate) device_context: ID3D11DeviceContext,
+ }
+@@ -89,7 +89,7 @@
+ }
+ 
+ #[inline]
+-fn get_dxgi_factory(debug_layer_available: bool) -> Result<IDXGIFactory6> {
++fn get_dxgi_factory(debug_layer_available: bool) -> Result<IDXGIFactory2> {
+     let factory_flag = if debug_layer_available {
+         DXGI_CREATE_FACTORY_DEBUG
+     } else {
+@@ -104,7 +104,7 @@
+ 
+ #[inline]
+ fn get_adapter(
+-    dxgi_factory: &IDXGIFactory6,
++    dxgi_factory: &IDXGIFactory2,
+     debug_layer_available: bool,
+ ) -> Result<(
+     IDXGIAdapter1,
+@@ -113,30 +113,50 @@
+     D3D_FEATURE_LEVEL,
+ )> {
+     for adapter_index in 0.. {
+-        let adapter: IDXGIAdapter1 = unsafe { dxgi_factory.EnumAdapters(adapter_index)?.cast()? };
+-        if let Ok(desc) = unsafe { adapter.GetDesc1() } {
+-            let gpu_name = String::from_utf16_lossy(&desc.Description)
+-                .trim_matches(char::from(0))
+-                .to_string();
+-            log::info!("Using GPU: {}", gpu_name);
+-        }
+-        // Check to see whether the adapter supports Direct3D 11 and create
+-        // the device if it does.
+-        let mut context: Option<ID3D11DeviceContext> = None;
+-        let mut feature_level = D3D_FEATURE_LEVEL::default();
+-        if let Some(device) = get_device(
+-            &adapter,
+-            Some(&mut context),
+-            Some(&mut feature_level),
+-            debug_layer_available,
+-        )
+-        .log_err()
+-        {
+-            return Ok((adapter, device, context.unwrap(), feature_level));
++        let adapter = match unsafe { dxgi_factory.EnumAdapters1(adapter_index) } {
++            Ok(adapter) => adapter,
++            Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => break,
++            Err(error) => return Err(error.into()),
++        };
++        match create_adapter_device(adapter, debug_layer_available) {
++            Ok(device) => return Ok(device),
++            Err(error) => log::warn!("Direct3D adapter initialization failed: {error:#}"),
+         }
+     }
+ 
+-    unreachable!()
++    log::warn!("No compatible hardware adapter; trying Direct3D WARP");
++    let factory: IDXGIFactory4 = dxgi_factory.cast()?;
++    let warp: IDXGIAdapter1 = unsafe { factory.EnumWarpAdapter() }?;
++    create_adapter_device(warp, false).context("Creating Direct3D WARP device")
++}
++
++fn create_adapter_device(
++    adapter: IDXGIAdapter1,
++    debug_layer_available: bool,
++) -> Result<(
++    IDXGIAdapter1,
++    ID3D11Device,
++    ID3D11DeviceContext,
++    D3D_FEATURE_LEVEL,
++)> {
++    if let Ok(desc) = unsafe { adapter.GetDesc1() } {
++        let gpu_name = String::from_utf16_lossy(&desc.Description);
++        log::info!("Using GPU: {}", gpu_name.trim_matches(char::from(0)));
++    }
++    let mut context = None;
++    let mut level = D3D_FEATURE_LEVEL::default();
++    let device = get_device(
++        &adapter,
++        Some(&mut context),
++        Some(&mut level),
++        debug_layer_available,
++    )?;
++    Ok((
++        adapter,
++        device,
++        context.context("Missing Direct3D context")?,
++        level,
++    ))
+ }
+ 
+ #[inline]
+@@ -147,6 +167,7 @@
+     debug_layer_available: bool,
+ ) -> Result<ID3D11Device> {
+     let mut device: Option<ID3D11Device> = None;
++    let mut level = D3D_FEATURE_LEVEL::default();
+     let device_flags = if debug_layer_available {
+         D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_DEBUG
+     } else {
+@@ -166,11 +187,17 @@
+             ]),
+             D3D11_SDK_VERSION,
+             Some(&mut device),
+-            feature_level,
++            Some(&mut level),
+             context,
+         )?;
+     }
+-    let device = device.unwrap();
++    let device = device.context("Missing Direct3D device")?;
++    if let Some(output) = feature_level {
++        unsafe { *output = level };
++    }
++    if level.0 >= D3D_FEATURE_LEVEL_11_0.0 {
++        return Ok(device);
++    }
+     let mut data = D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS::default();
+     unsafe {
+         device
+--- a/vendor/gpui-fast-windows/src/directx_renderer.rs
++++ b/vendor/gpui-fast-windows/src/directx_renderer.rs
+@@ -64,7 +64,7 @@
+ #[derive(Clone)]
+ pub(crate) struct DirectXRendererDevices {
+     pub(crate) adapter: IDXGIAdapter1,
+-    pub(crate) dxgi_factory: IDXGIFactory6,
++    pub(crate) dxgi_factory: IDXGIFactory2,
+     pub(crate) device: ID3D11Device,
+     pub(crate) device_context: ID3D11DeviceContext,
+     dxgi_device: Option<IDXGIDevice>,
+@@ -1318,7 +1318,7 @@
+ }
+ 
+ pub(crate) fn create_swap_chain_for_composition(
+-    dxgi_factory: &IDXGIFactory6,
++    dxgi_factory: &IDXGIFactory2,
+     device: &ID3D11Device,
+     width: u32,
+     height: u32,
+@@ -1344,7 +1344,7 @@
+ }
+ 
+ fn create_swap_chain(
+-    dxgi_factory: &IDXGIFactory6,
++    dxgi_factory: &IDXGIFactory2,
+     device: &ID3D11Device,
+     hwnd: HWND,
+     width: u32,
+--- a/vendor/gpui-fast-windows/src/window.rs
++++ b/vendor/gpui-fast-windows/src/window.rs
+@@ -146,6 +146,22 @@
+         let border_offset = WindowBorderOffset::default();
+         let restore_from_minimized = None;
+         let renderer = DirectXRenderer::new(hwnd, directx_devices, disable_direct_composition)
++            .or_else(|error| {
++                if disable_direct_composition {
++                    return Err(error);
++                }
++                log::warn!("DirectComposition failed, trying a plain HWND swap chain: {error:#}");
++                unsafe {
++                    let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
++                    SetWindowLongPtrW(
++                        hwnd,
++                        GWL_EXSTYLE,
++                        style & !(WS_EX_NOREDIRECTIONBITMAP.0 as isize),
++                    );
++                }
++                DirectXRenderer::new(hwnd, directx_devices, true)
++                    .with_context(|| format!("DirectComposition also failed: {error:#}"))
++            })
+             .context("Creating DirectX renderer")?;
+         let callbacks = Callbacks::default();
+         let input_handler = None;

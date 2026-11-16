@@ -1,116 +1,194 @@
 use super::stream::{BufferedSource, StreamingAudio};
+use arc_swap::ArcSwap;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use smallvec::SmallVec;
 use std::{
+    collections::VecDeque,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
 
-#[derive(Default)]
-struct OutputSources {
-    current: Option<BufferedSource>,
-    // 交接后暂存旧音源，留给控制器线程释放。
-    next: Option<BufferedSource>,
-    armed: bool,
+// The low bits identify the current track. Updating the epoch when freezing
+// prevents a callback with an old queue snapshot from committing after rearm.
+const TRACK_MASK: u64 = u32::MAX as u64;
+const EPOCH_STEP: u64 = 1 << 32;
+const FROZEN: u64 = 1 << 63;
+
+struct OutputSlot {
+    id: u32,
+    format: (u32, u16),
+    ready: bool,
+    source: Mutex<Option<BufferedSource>>,
 }
 
+struct Track {
+    audio: StreamingAudio,
+    slot: Arc<OutputSlot>,
+}
+
+#[derive(Default)]
 struct OutputControl {
     playing: AtomicBool,
-    volume: AtomicU32,
+    start_at_full_gain: AtomicBool,
     error: Mutex<Option<String>>,
-    sources: Mutex<OutputSources>,
-    switched: AtomicBool,
+    // Volume defaults to zero bits, so construction explicitly initializes it.
+    volume: AtomicU32,
+    queue: ArcSwap<SmallVec<[Arc<OutputSlot>; 3]>>,
+    gate: AtomicU64,
 }
 
-impl Default for OutputControl {
-    fn default() -> Self {
-        Self {
-            playing: AtomicBool::new(false),
-            volume: AtomicU32::new(1_f32.to_bits()),
-            error: Mutex::new(None),
-            sources: Mutex::default(),
-            switched: AtomicBool::new(false),
-        }
-    }
-}
-
-/// 按歌曲采样率和声道数提交 f32 PCM，由系统共享输出适配设备格式。
 #[derive(Default)]
+struct CallbackOutput {
+    current: Option<(u32, BufferedSource)>,
+}
+
 pub(super) struct PlayerEngine {
     device: Option<(cpal::Stream, cpal::StreamConfig)>,
-    audio: Option<StreamingAudio>,
-    next_audio: Option<StreamingAudio>,
-    next_frozen: bool,
+    current: Option<Track>,
+    next: VecDeque<Track>,
+    track_id: u32,
     control: Arc<OutputControl>,
+    #[cfg(test)]
+    output: std::cell::RefCell<CallbackOutput>,
+}
+
+impl Default for PlayerEngine {
+    fn default() -> Self {
+        Self {
+            device: None,
+            current: None,
+            next: VecDeque::new(),
+            track_id: 0,
+            control: Arc::new(OutputControl {
+                volume: AtomicU32::new(1_f32.to_bits()),
+                ..Default::default()
+            }),
+            #[cfg(test)]
+            output: Default::default(),
+        }
+    }
 }
 
 impl PlayerEngine {
-    pub fn load(
-        &mut self,
-        audio: StreamingAudio,
-        mut source: BufferedSource,
-    ) -> Result<(), String> {
+    pub fn load(&mut self, audio: StreamingAudio, source: BufferedSource) -> Result<(), String> {
         self.stop();
         self.ensure_device(source.sample_rate, source.channels)?;
-        source.playback_gain = 0.;
-        self.control.sources.lock().unwrap().current = Some(source);
-        self.audio = Some(audio);
+        self.install(audio, source);
         Ok(())
     }
 
+    fn track(&mut self, audio: StreamingAudio, source: BufferedSource, ready: bool) -> Track {
+        self.track_id = self.track_id.wrapping_add(1).max(1);
+        Track {
+            audio,
+            slot: Arc::new(OutputSlot {
+                id: self.track_id,
+                format: (source.sample_rate, source.channels),
+                ready,
+                source: Mutex::new(Some(source)),
+            }),
+        }
+    }
+
+    fn install(&mut self, audio: StreamingAudio, mut source: BufferedSource) {
+        source.playback_gain = 0.;
+        self.current = Some(self.track(audio, source, true));
+        self.publish_queue();
+        self.control
+            .gate
+            .store(u64::from(self.track_id), Ordering::Release);
+    }
+
+    fn publish_queue(&self) {
+        let slots = self
+            .current
+            .iter()
+            .chain(&self.next)
+            .map(|track| track.slot.clone());
+        self.control.queue.store(Arc::new(slots.collect()));
+    }
+
     pub fn stage_next(&mut self, audio: StreamingAudio, mut source: BufferedSource) {
-        let primed = source.prime();
-        let mut sources = self.control.sources.lock().unwrap();
-        sources.armed = primed
-            && sources.current.as_ref().is_some_and(|current| {
-                current.sample_rate == source.sample_rate && current.channels == source.channels
-            });
-        sources.next = Some(source);
-        self.next_audio = Some(audio);
+        let ready = source.prime();
+        let track = self.track(audio, source, ready);
+        self.next.push_back(track);
+        self.publish_queue();
     }
 
-    /// 改队列或定位前先冻结交接，并结算可能已由回调完成的切换。
-    /// 常规轮询只检查原子标志，避免和音频回调争抢锁。
-    pub fn settle_gapless(&mut self, freeze: bool) -> bool {
-        if self.next_audio.is_none() || (!freeze && !self.control.switched.load(Ordering::Acquire))
-        {
-            return false;
-        }
-        let mut sources = self.control.sources.lock().unwrap();
-        if self.control.switched.swap(false, Ordering::AcqRel) {
-            let retired = sources.next.take();
-            drop(sources);
-            self.next_frozen = false;
-            self.audio = self.next_audio.take();
-            drop(retired);
-            return true;
-        }
-        if freeze {
-            self.next_frozen |= std::mem::take(&mut sources.armed);
-        }
-        false
-    }
-
-    pub fn rearm_next(&mut self) {
-        if std::mem::take(&mut self.next_frozen) {
-            self.control.sources.lock().unwrap().armed = true;
+    fn freeze(&self) -> u64 {
+        let mut gate = self.control.gate.load(Ordering::Acquire);
+        loop {
+            if gate & FROZEN != 0 {
+                return gate;
+            }
+            let frozen = gate.wrapping_add(EPOCH_STEP) | FROZEN;
+            match self.control.gate.compare_exchange_weak(
+                gate,
+                frozen,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return frozen,
+                Err(actual) => gate = actual,
+            }
         }
     }
 
-    /// 手动切歌及跨格式续播可以复用已经准备好的音源。
+    /// Freeze and observe the same atomic state used by the callback to claim a successor.
+    pub fn settle_gapless(&mut self, freeze: bool) -> usize {
+        let gate = if freeze {
+            self.freeze()
+        } else {
+            self.control.gate.load(Ordering::Acquire)
+        };
+        let id = gate as u32;
+        let Some(index) = self.next.iter().position(|track| track.slot.id == id) else {
+            return 0;
+        };
+        let count = index + 1;
+        for _ in 0..count {
+            self.current = self.next.pop_front();
+        }
+        count
+    }
+
+    pub fn rearm_next(&self) {
+        self.control.gate.fetch_and(!FROZEN, Ordering::Release);
+    }
+
+    pub fn clear_next(&mut self) {
+        self.freeze();
+        self.next.clear();
+        self.publish_queue();
+    }
+
+    /// A frozen, unclaimed successor can be reused by ordinary loading.
     pub fn take_next(&mut self) -> Option<(StreamingAudio, BufferedSource)> {
-        let audio = self.next_audio.take()?;
-        let mut sources = self.control.sources.lock().unwrap();
-        sources.armed = false;
-        self.next_frozen = false;
-        let source = sources.next.take().unwrap();
-        Some((audio, source))
+        let claimed = self.freeze() as u32;
+        if self
+            .current
+            .as_ref()
+            .is_none_or(|track| track.slot.id != claimed)
+        {
+            return None;
+        }
+        let track = self.next.pop_front()?;
+        self.publish_queue();
+        let source = track.slot.source.lock().unwrap().take()?;
+        Some((track.audio, source))
+    }
+
+    pub fn staged_download_complete(&self) -> bool {
+        self.next
+            .back()
+            .is_some_and(|track| track.audio.download_complete())
     }
 
     pub fn audio(&self) -> Option<&StreamingAudio> {
-        self.audio.as_ref()
+        self.current.as_ref().map(|track| &track.audio)
     }
 
     fn ensure_device(&mut self, sample_rate: u32, channels: u16) -> Result<(), String> {
@@ -129,36 +207,32 @@ impl PlayerEngine {
             sample_rate,
             buffer_size: cpal::BufferSize::Default,
         };
-        // ponytail: 依赖共享后端适配格式；其他后端拒绝时报告错误，支持它们时再加适配。
-        let control = self.control.clone();
-        let errors = self.control.clone();
-        let stream = device
-            .build_output_stream(
-                &stream_config,
-                move |buffer: &mut [f32], _| write_output(buffer, &control),
-                move |error| {
-                    errors.playing.store(false, Ordering::Release);
-                    *errors.error.lock().unwrap() = Some(format!("音频输出失败：{error}"));
-                },
-                None,
-            )
-            .map_err(|error| format!("无法创建音频输出流：{error}"))?;
-        // 保持流运行，暂停淡出结束后只写静音，不消费 PCM。
-        stream
-            .play()
-            .map_err(|error| format!("无法启动音频输出：{error}"))?;
+        let open = || build_output::<f32>(&device, &stream_config, self.control.clone());
+        #[cfg(target_os = "windows")]
+        let stream = open().or_else(|float_error| {
+            // Some WASAPI drivers reject WAVEFORMATEXTENSIBLE float but accept
+            // standard PCM for the same sample rate and channel count.
+            log::warn!("WASAPI f32 初始化失败，尝试 16-bit PCM：{float_error}");
+            *self.control.error.lock().unwrap() = None;
+            build_output::<i16>(&device, &stream_config, self.control.clone())
+                .map_err(|pcm_error| format!("{float_error}；16-bit PCM：{pcm_error}"))
+        })?;
+        #[cfg(not(target_os = "windows"))]
+        let stream = open()?;
         self.device = Some((stream, stream_config));
         Ok(())
     }
 
     pub fn stop(&mut self) {
         self.pause();
-        let sources = std::mem::take(&mut *self.control.sources.lock().unwrap());
-        self.control.switched.store(false, Ordering::Release);
-        self.next_frozen = false;
-        self.next_audio = None;
-        self.audio = None;
-        drop(sources);
+        self.freeze();
+        self.control.gate.store(0, Ordering::Release);
+        self.control
+            .start_at_full_gain
+            .store(false, Ordering::Release);
+        self.next.clear();
+        self.current = None;
+        self.publish_queue();
         // 正常停止保留输出设备；设备报错时释放，下次播放重新打开。
         let device_failed = self.control.error.lock().unwrap().is_some();
         if device_failed {
@@ -168,38 +242,32 @@ impl PlayerEngine {
     }
 
     pub fn has_source(&self) -> bool {
-        self.audio.is_some()
+        self.current.is_some()
     }
 
     pub fn finished(&self) -> bool {
-        self.audio.as_ref().is_some_and(StreamingAudio::finished)
+        self.audio().is_some_and(StreamingAudio::finished)
     }
 
     pub fn buffering(&self) -> bool {
-        self.audio.as_ref().is_some_and(StreamingAudio::buffering)
+        self.audio().is_some_and(StreamingAudio::buffering)
     }
 
     pub fn download_complete(&self) -> bool {
-        self.audio
-            .as_ref()
-            .is_some_and(StreamingAudio::download_complete)
+        self.audio().is_some_and(StreamingAudio::download_complete)
     }
 
     pub fn download_failed(&self) -> bool {
-        self.audio
-            .as_ref()
-            .is_some_and(StreamingAudio::download_failed)
+        self.audio().is_some_and(StreamingAudio::download_failed)
     }
 
     pub fn stalled(&self, timeout: Duration) -> bool {
-        self.audio
-            .as_ref()
-            .is_some_and(|audio| audio.stalled(timeout))
+        self.audio().is_some_and(|audio| audio.stalled(timeout))
     }
 
     /// 播放地址已使用的时长；没有音源时为 None。
     pub fn source_age(&self) -> Option<Duration> {
-        self.audio.as_ref().map(StreamingAudio::source_age)
+        self.audio().map(StreamingAudio::source_age)
     }
 
     pub fn pause(&self) {
@@ -214,22 +282,19 @@ impl PlayerEngine {
 
     /// 新音源和自动重播直接起播；只有用户播放/暂停操作使用渐变。
     pub fn start(&self) -> bool {
-        if let Some(source) = self.control.sources.lock().unwrap().current.as_mut() {
-            source.playback_gain = 1.;
-            // 与回调共用音源锁，不能在设置增益后先执行一次暂停淡出。
-            return self.resume();
-        }
-        false
+        self.control
+            .start_at_full_gain
+            .store(true, Ordering::Release);
+        self.resume()
     }
 
     pub fn position(&self) -> Duration {
-        self.audio
-            .as_ref()
+        self.audio()
             .map_or(Duration::ZERO, StreamingAudio::position)
     }
 
     pub fn seek_to(&self, position: Duration) -> bool {
-        if let Some(audio) = &self.audio {
+        if let Some(audio) = self.audio() {
             audio.seek(position);
             true
         } else {
@@ -243,7 +308,7 @@ impl PlayerEngine {
             .lock()
             .unwrap()
             .clone()
-            .or_else(|| self.audio.as_ref().and_then(StreamingAudio::error))
+            .or_else(|| self.audio().and_then(StreamingAudio::error))
     }
 
     pub fn volume(&self) -> f32 {
@@ -261,34 +326,140 @@ impl PlayerEngine {
     }
 }
 
-/// 回调只尝试获取音源锁，网络欠载、暂停或无下一首时输出静音。
-fn write_output(buffer: &mut [f32], control: &OutputControl) {
-    let Ok(mut sources) = control.sources.try_lock() else {
+trait OutputSample: cpal::SizedSample {
+    fn render(
+        output: &mut CallbackOutput,
+        buffer: &mut [Self],
+        control: &OutputControl,
+        channels: usize,
+    );
+}
+
+impl OutputSample for f32 {
+    fn render(output: &mut CallbackOutput, buffer: &mut [Self], control: &OutputControl, _: usize) {
+        output.write(buffer, control);
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl OutputSample for i16 {
+    fn render(
+        output: &mut CallbackOutput,
+        buffer: &mut [Self],
+        control: &OutputControl,
+        channels: usize,
+    ) {
+        use cpal::Sample;
+        let mut scratch = [0.; 1024];
+        if !(1..=scratch.len()).contains(&channels) {
+            buffer.fill(0);
+            return;
+        }
+        let chunk_size = channels * (scratch.len() / channels);
+        for chunk in buffer.chunks_mut(chunk_size) {
+            let pcm = &mut scratch[..chunk.len()];
+            output.write(pcm, control);
+            for (sample, &value) in chunk.iter_mut().zip(pcm.iter()) {
+                *sample = i16::from_sample(value);
+            }
+        }
+    }
+}
+
+fn build_output<T: OutputSample>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    control: Arc<OutputControl>,
+) -> Result<cpal::Stream, String> {
+    let mut output = CallbackOutput::default();
+    let channels = usize::from(config.channels);
+    let errors = control.clone();
+    let stream = device
+        .build_output_stream(
+            config,
+            move |buffer: &mut [T], _| T::render(&mut output, buffer, &control, channels),
+            move |error| {
+                errors.playing.store(false, Ordering::Release);
+                *errors.error.lock().unwrap() = Some(format!("音频输出失败：{error}"));
+            },
+            None,
+        )
+        .map_err(|error| format!("无法创建音频输出流：{error}"))?;
+    stream
+        .play()
+        .map_err(|error| format!("无法启动音频输出：{error}"))?;
+    Ok(stream)
+}
+
+impl CallbackOutput {
+    fn write(&mut self, mut buffer: &mut [f32], control: &OutputControl) {
+        let current = control.gate.load(Ordering::Acquire) as u32;
+        if self.current.as_ref().map(|(id, _)| *id) != Some(current) {
+            let queue = control.queue.load();
+            self.current = queue
+                .iter()
+                .find(|slot| slot.id == current)
+                .and_then(|slot| {
+                    slot.source
+                        .try_lock()
+                        .ok()?
+                        .take()
+                        .map(|source| (slot.id, source))
+                });
+        }
+        let playing = control.playing.load(Ordering::Acquire);
+        let volume = f32::from_bits(control.volume.load(Ordering::Acquire));
+        if playing
+            && control.start_at_full_gain.swap(false, Ordering::AcqRel)
+            && let Some((_, source)) = &mut self.current
+        {
+            source.playback_gain = 1.;
+        }
+        while let Some((current, source)) = &mut self.current {
+            let end = source.write_playback(buffer, volume, playing);
+            if end == buffer.len() {
+                return;
+            }
+            if !playing {
+                source.confirm_end();
+                return;
+            }
+            // Read the gate before the immutable queue. A freeze invalidates
+            // this claim even if the controller rearms before the CAS.
+            let gate = control.gate.load(Ordering::Acquire);
+            if gate & FROZEN != 0 || gate as u32 != *current {
+                source.confirm_end();
+                return;
+            }
+            let queue = control.queue.load();
+            let mut after_current = queue.iter().skip_while(|slot| slot.id != *current).skip(1);
+            let Some(next) = after_current
+                .next()
+                .filter(|slot| slot.ready && slot.format == (source.sample_rate, source.channels))
+            else {
+                source.confirm_end();
+                return;
+            };
+            let claim = (gate & !TRACK_MASK) | u64::from(next.id);
+            if control
+                .gate
+                .compare_exchange(gate, claim, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                source.confirm_end();
+                return;
+            }
+            // Only the successful claimant can take this source. The controller
+            // takes unclaimed sources only after freezing the gate.
+            let Some(mut successor) = next.source.try_lock().ok().and_then(|mut item| item.take())
+            else {
+                return;
+            };
+            successor.playback_gain = source.playback_gain;
+            self.current = Some((next.id, successor));
+            buffer = &mut buffer[end..];
+        }
         buffer.fill(0.);
-        return;
-    };
-    let OutputSources {
-        current,
-        next,
-        armed,
-    } = &mut *sources;
-    let Some(source) = current.as_mut() else {
-        buffer.fill(0.);
-        return;
-    };
-    let playing = control.playing.load(Ordering::Acquire);
-    let volume = f32::from_bits(control.volume.load(Ordering::Acquire));
-    let end = source.write_playback(buffer, volume, playing);
-    if end < buffer.len()
-        && playing
-        && *armed
-        && let Some(successor) = next.as_mut()
-    {
-        successor.playback_gain = source.playback_gain;
-        successor.write_playback(&mut buffer[end..], volume, playing);
-        std::mem::swap(current, next);
-        *armed = false;
-        control.switched.store(true, Ordering::Release);
     }
 }
 
@@ -301,14 +472,13 @@ pub(super) mod tests {
     pub(in crate::playback) async fn play_short_wav(samples: &[i16]) -> PlayerEngine {
         let (audio, source) = short_wav(samples, 48_000, 2).await;
         let mut engine = PlayerEngine::default();
-        engine.control.sources.lock().unwrap().current = Some(source);
-        engine.audio = Some(audio);
+        engine.install(audio, source);
         assert!(engine.start());
         engine
     }
 
     pub(in crate::playback) fn render_test_output(engine: &PlayerEngine, buffer: &mut [f32]) {
-        write_output(buffer, &engine.control);
+        engine.output.borrow_mut().write(buffer, &engine.control);
     }
 
     #[tokio::test]
@@ -323,24 +493,74 @@ pub(super) mod tests {
 
             let mut actual = [f32::NAN; 10];
             let (first, second) = actual.split_at_mut(first_buffer_size);
-            write_output(first, &engine.control);
+            render_test_output(&engine, first);
             assert_eq!(
-                engine.control.switched.load(Ordering::Acquire),
+                engine.control.gate.load(Ordering::Acquire) as u32
+                    != engine.current.as_ref().unwrap().slot.id,
                 first_buffer_size == 6
             );
-            write_output(second, &engine.control);
+            render_test_output(&engine, second);
 
             assert_eq!(actual, samples.map(|sample| f32::from(sample) / 65536.));
-            assert!(engine.settle_gapless(false));
-            assert!(!engine.settle_gapless(false));
+            assert_eq!(engine.settle_gapless(false), 1);
+            assert_eq!(engine.settle_gapless(false), 0);
             assert!(engine.position() >= Duration::from_micros(62));
             assert!(!engine.finished());
 
             let mut end = [1.; 2];
-            write_output(&mut end, &engine.control);
+            render_test_output(&engine, &mut end);
             assert_eq!(end, [0.; 2]);
             assert!(engine.finished());
         }
+    }
+
+    #[tokio::test]
+    async fn output_consumes_two_successors_in_one_callback() {
+        let mut engine = play_short_wav(&[8192, -8192]).await;
+        for sample in [4096, 2048] {
+            let (audio, source) = short_wav(&[sample, -sample], 48_000, 2).await;
+            engine.stage_next(audio, source);
+        }
+        let mut frames = [f32::NAN; 6];
+        render_test_output(&engine, &mut frames);
+        assert_eq!(frames, [0.25, -0.25, 0.125, -0.125, 0.0625, -0.0625]);
+        assert_eq!(engine.settle_gapless(false), 2);
+        assert_eq!(engine.settle_gapless(false), 0);
+    }
+
+    #[tokio::test]
+    async fn integer_output_preserves_the_track_boundary() {
+        let mut engine = play_short_wav(&[8192, -8192]).await;
+        let (audio, source) = short_wav(&[4096, -4096], 48_000, 2).await;
+        engine.stage_next(audio, source);
+        let mut buffer = [0_i16; 4];
+        i16::render(
+            &mut engine.output.borrow_mut(),
+            &mut buffer,
+            &engine.control,
+            2,
+        );
+        assert_eq!(buffer, [8192, -8192, 4096, -4096]);
+    }
+
+    #[tokio::test]
+    async fn callback_continues_current_audio_during_queue_updates() {
+        let mut engine = play_short_wav(&[8192, -8192, 4096, -4096]).await;
+        let (audio, source) = short_wav(&[2048, -2048], 48_000, 2).await;
+        engine.stage_next(audio, source);
+
+        let queued = engine.next[0].slot.clone();
+        let pending_slot = queued.source.lock().unwrap();
+        let mut frames = [f32::NAN; 4];
+        render_test_output(&engine, &mut frames);
+        assert_eq!(frames, [0.25, -0.25, 0.125, -0.125]);
+        drop(pending_slot);
+        assert_eq!(engine.settle_gapless(true), 0);
+        engine.clear_next();
+        engine.rearm_next();
+        render_test_output(&engine, &mut frames);
+        assert_eq!(frames, [0.; 4]);
+        assert_eq!(engine.settle_gapless(false), 0);
     }
 
     #[tokio::test]
@@ -351,14 +571,14 @@ pub(super) mod tests {
             let (next, output) = short_wav(&[16384, -16384], rate, channels).await;
             engine.stage_next(next, output);
             if freeze {
-                assert!(!engine.settle_gapless(true));
+                assert_eq!(engine.settle_gapless(true), 0);
             }
 
             let mut frames = [1.; 4];
-            write_output(&mut frames, &engine.control);
+            render_test_output(&engine, &mut frames);
             assert_eq!(frames, [0.25, -0.25, 0., 0.]);
             assert!(engine.finished());
-            assert!(!engine.settle_gapless(false));
+            assert_eq!(engine.settle_gapless(false), 0);
 
             let (next, mut source) = engine.take_next().unwrap();
             assert_eq!(next.position(), Duration::ZERO);
@@ -374,26 +594,18 @@ pub(super) mod tests {
         engine.stage_next(next, output);
         engine.pause();
         let mut frames = [1.; 4];
-        write_output(&mut frames, &engine.control);
+        render_test_output(&engine, &mut frames);
         assert_eq!(frames[2..], [0.; 2]);
-        assert!(!engine.settle_gapless(true));
+        assert_eq!(engine.settle_gapless(true), 0);
         let (next, _) = engine.take_next().unwrap();
         assert_eq!(next.position(), Duration::ZERO);
     }
 
     #[test]
-    fn output_silences_missing_paused_or_busy_source_without_blocking() {
-        let control = OutputControl::default();
+    fn output_silences_missing_source() {
+        let engine = PlayerEngine::default();
         let mut buffer = [1_f32; 4];
-        write_output(&mut buffer, &control);
-        assert_eq!(buffer, [0.; 4]);
-        control.playing.store(true, Ordering::Release);
-        buffer.fill(1.);
-        write_output(&mut buffer, &control);
-        assert_eq!(buffer, [0.; 4]);
-        let _busy = control.sources.lock().unwrap();
-        buffer.fill(1.);
-        write_output(&mut buffer, &control);
+        render_test_output(&engine, &mut buffer);
         assert_eq!(buffer, [0.; 4]);
     }
 

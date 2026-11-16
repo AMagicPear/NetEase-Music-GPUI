@@ -1,0 +1,36 @@
+name: Windows validation
+
+on:
+  pull_request:
+  push:
+    branches: [main, 'feat/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Prepare GPUI
+        run: python scripts/prepare_gpui.py
+        env:
+          GPUI_CRATE_SOURCE: https://static.crates.io/crates/{name}/{name}-{version}.crate
+      - name: Test
+        run: cargo test --locked
+      - name: Test packaging
+        run: python -m unittest discover -s scripts -p test_package.py
+      - name: Build Windows ZIP
+        run: python scripts/package.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: |
+            target/bundle/*-x86_64-pc-windows-msvc.zip
+            target/bundle/*-x86_64-pc-windows-msvc.zip.sha256
+          if-no-files-found: error
