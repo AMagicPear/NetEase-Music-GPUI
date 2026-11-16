@@ -36,10 +36,12 @@ pub(super) struct Pcm {
     pub position_us: AtomicU64,
     // 输出端确认最后一个 PCM 已消费，控制器才允许自动切歌。
     pub output_drained: AtomicBool,
+    // 解码已结束，排队的最后一块也已经交给输出端。
+    pub closed_queue: AtomicBool,
     pub buffering: AtomicBool,
 }
 
-/// 网络不足与 EOF 均输出静音；播放源保持可 seek，自动切歌由控制器接管。
+/// 单曲 PCM 消费端；缓冲欠载与正常曲终分别报告。
 pub struct BufferedSource {
     pub(super) pcm: Arc<Pcm>,
     pub(crate) channels: u16,
@@ -50,12 +52,35 @@ pub struct BufferedSource {
 }
 
 impl BufferedSource {
-    /// 读取一个完整声道帧；缺数据时写静音，取消后返回 false。
-    pub fn read_frame(&mut self, frame: &mut [f32]) -> bool {
+    fn pop_chunk(pcm: &Pcm, data: &mut PcmData) -> Option<Chunk> {
+        let chunk = data.chunks.pop_front()?;
+        data.queued_samples -= chunk.samples.len();
+        if data.decode_finished {
+            if data.chunks.is_empty() && data.error.is_none() {
+                pcm.closed_queue.store(true, Ordering::Release);
+            }
+        } else {
+            pcm.changed.notify_one();
+        }
+        Some(chunk)
+    }
+
+    /// 提前取出下一首的首个 PCM 块，交接时无需争抢解码器的锁。
+    pub(crate) fn prime(&mut self) -> bool {
+        let mut data = self.pcm.data.lock().unwrap();
+        if data.error.is_some() || data.chunks.is_empty() {
+            return false;
+        }
+        self.chunk = Self::pop_chunk(&self.pcm, &mut data);
+        self.pcm.buffering.store(false, Ordering::Release);
+        true
+    }
+
+    fn read_pcm_frame(&mut self, frame: &mut [f32]) -> FrameRead {
         assert_eq!(frame.len(), self.channels as usize);
         frame.fill(0.);
         if self.pcm.control.cancelled.load(Ordering::Acquire) {
-            return false;
+            return FrameRead::Cancelled;
         }
         let generation = self.pcm.control.generation.load(Ordering::Acquire);
         if self
@@ -65,8 +90,9 @@ impl BufferedSource {
         {
             self.chunk = None;
         }
+        let pcm = &self.pcm;
         if self.chunk.is_none()
-            && let Ok(mut data) = self.pcm.data.try_lock()
+            && let Ok(mut data) = pcm.data.try_lock()
         {
             let minimum =
                 (self.sample_rate as f64 * self.channels as f64 * BUFFER_SECONDS) as usize;
@@ -75,22 +101,25 @@ impl BufferedSource {
                 && !data.decode_finished
                 && data.error.is_none()
             {
-                return true;
+                return FrameRead::Continue;
             }
-            self.chunk = data.chunks.pop_front();
-            if let Some(chunk) = &self.chunk {
-                data.queued_samples -= chunk.samples.len();
-                self.pcm.changed.notify_one();
-            }
+            self.chunk = Self::pop_chunk(pcm, &mut data);
             self.sample_index = 0;
             let drained = self.chunk.is_none() && data.decode_finished && data.error.is_none();
             self.pcm.output_drained.store(drained, Ordering::Release);
             self.pcm
                 .buffering
                 .store(self.chunk.is_none() && !drained, Ordering::Release);
+            if drained {
+                return FrameRead::End;
+            }
+        } else if self.chunk.is_none() && pcm.closed_queue.load(Ordering::Acquire) {
+            // 曲终已经确定；后台短暂持锁也无需在接缝插入静音。
+            // 无锁读取不更新 output_drained，避免覆盖并发 seek 的重置。
+            return FrameRead::End;
         }
         let Some(chunk) = &self.chunk else {
-            return true;
+            return FrameRead::Continue;
         };
         frame.copy_from_slice(&chunk.samples[self.sample_index..self.sample_index + frame.len()]);
         self.sample_index += frame.len();
@@ -107,10 +136,16 @@ impl BufferedSource {
         if self.sample_index == chunk.samples.len() {
             self.chunk = None;
         }
-        true
+        FrameRead::Continue
     }
 
-    /// 直接填充 CPAL 的交错 f32 缓冲，并应用音量。
+    #[cfg(test)]
+    pub fn read_frame(&mut self, frame: &mut [f32]) -> bool {
+        self.read_pcm_frame(frame) != FrameRead::Cancelled
+    }
+
+    /// 直接填充交错 f32 缓冲，并应用音量。
+    #[cfg(test)]
     pub fn write(&mut self, output: &mut [f32], volume: f32) {
         for frame in output.chunks_mut(self.channels as usize) {
             self.read_frame(frame);
@@ -120,20 +155,43 @@ impl BufferedSource {
         }
     }
 
-    /// 渐变按声道帧推进，暂停淡出结束后停止消费 PCM；快速反向操作接续当前增益。
-    pub(crate) fn write_playback(&mut self, output: &mut [f32], volume: f32, playing: bool) {
+    /// 渐变按声道帧推进，暂停淡出结束后停止消费 PCM。
+    /// 正常曲终时返回本次回调的接续位置，其他情况返回缓冲区长度。
+    pub(crate) fn write_playback(
+        &mut self,
+        output: &mut [f32],
+        volume: f32,
+        playing: bool,
+    ) -> usize {
+        let channels = self.channels as usize;
         let step = 1. / (self.sample_rate as f32 * FADE_SECONDS);
-        for frame in output.chunks_mut(self.channels as usize) {
+        for (index, frame) in output.chunks_mut(channels).enumerate() {
             if !playing && self.playback_gain == 0. {
                 frame.fill(0.);
                 continue;
+            }
+            if self.read_pcm_frame(frame) == FrameRead::End && playing {
+                let end = index * channels;
+                output[end..].fill(0.);
+                return end;
             }
             self.playback_gain = if playing {
                 (self.playback_gain + step).min(1.)
             } else {
                 (self.playback_gain - step).max(0.)
             };
-            self.write(frame, volume * self.playback_gain);
+            let gain = volume * self.playback_gain;
+            for sample in frame {
+                *sample = (*sample * gain).clamp(-1., 1.);
+            }
         }
+        output.len()
     }
+}
+
+#[derive(PartialEq, Eq)]
+enum FrameRead {
+    Continue,
+    End,
+    Cancelled,
 }
